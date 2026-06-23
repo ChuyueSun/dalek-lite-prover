@@ -44,8 +44,9 @@ The pin is *recorded* in the emitted manifest; enforcing it during a run
 (retaining the frozen consumer, diffing the oracle) is the runner's job,
 not the builder's. The builder's contract is only: refuse P4 without one.
 
-This is a top-level init/harness tool — a sibling of `run.py` / `admit.py`
-/ `strip_specs.py`, NOT an agent skill. The proof agent never calls it.
+This is an init/harness tool, NOT an agent skill. It composes `admit.py` and
+`skills/strip_specs.py` to build a starting state before a run; the proof agent
+never calls it.
 
 Usage:
     # File mode — peel one file in place / to --out (debuggable like admit.py)
@@ -85,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -320,8 +322,7 @@ def peel_worktree(
 
 
 # ── classify_cone: a directory-cut manifest GENERATOR ────────────────────────
-# Port of launch_specgen.sh's --strip-to-fields layer boundary. This is the
-# "reference oracle" classify_cone: it derives a peel manifest by DIRECTORY,
+# Directory-cut manifest generator. This derives a peel manifest by DIRECTORY,
 # not by dependency closure. It is a generator (emits a manifest you can edit
 # and pass to --manifest), NOT a runtime dependency of the peel pipeline — the
 # manifest IS the declared cone. A dependency-closure classify_cone can replace
@@ -340,7 +341,7 @@ _CONE_DELETE_DIRS = (
 _CONE_API_FILES = ("edwards.rs", "montgomery.rs", "ristretto.rs", "scalar.rs")
 _CONE_SKIP_FILES = ("axioms.rs", "mod.rs")  # pure-axiom / module glue: stay frozen
 
-_PROOF_FN_NAME_RE = __import__("re").compile(r"\bproof\s+fn\s+(\w+)")
+_PROOF_FN_NAME_RE = re.compile(r"\bproof\s+fn\s+(\w+)")
 
 
 def _nonaxiom_proof_fns(text: str) -> list[str]:
@@ -373,9 +374,8 @@ def classify_cone(project: Path) -> dict:
     for name in _CONE_API_FILES:
         f = src / name
         if f.is_file():
-            # Faithful to launch_specgen's stf_strip_all_proofs: the API exec
-            # files are RED-stripped (remove inline proofs, keep contract +
-            # exec), NOT admitted. Whole-file (strip-all).
+            # API exec files are RED-stripped (remove inline proofs, keep
+            # contract + exec), NOT admitted. Whole-file (strip-all).
             files.append({
                 "path": str(f.relative_to(project.parent)),
                 "proof_op": "strip-all",

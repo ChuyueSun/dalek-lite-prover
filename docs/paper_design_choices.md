@@ -68,9 +68,9 @@ answer in one command.
 
 ## 2. Ristretto rung (`--no-ristretto-proof`) — pure proof-body strip + a soundness wrinkle
 
-The spec-strip difficulty ladder (`demo_decompress.sh`) was extended UP one layer to
-RISTRETTO via `--no-ristretto-proof` (`run.py --experiment-mode bridge-full`,
-target = `ristretto.rs`, editable = ristretto.rs ONLY). Facts from mapping
+The spec-strip difficulty ladder was extended up one layer to RISTRETTO as a
+pure proof-reconstruction run (`run.py --experiment-mode bridge-full`, target =
+`ristretto.rs`, editable = ristretto.rs only). Facts from mapping
 `CompressedRistretto::decompress`'s proof tree (2026-06-21):
 
 1. **No dedicated deletable lemma layer.** Every lemma `decompress`/`step_1`/`step_2`
@@ -192,12 +192,12 @@ agent's reconstruction is uniformly **leaner** than gt (every API proof shorter;
 ## 4. Init-state construction is reconciled into one builder (`peel`) with an enforced pin rule
 
 The rung init-states above were originally built by bespoke
-`strip_specs.py`/`admit.py` invocation sequences hard-coded per rung in
-`demo_decompress.sh` / `launch_specgen.sh`. They are now expressed as declarative
-**peel manifests** (`peel_manifests/*.json`) built by `peel.py`, with
-`peel_run.sh` chaining the build to `run.py`. **This is a build-side change only —
-`run.py` and every gate in §1 are untouched; the runtime soundness story is
-identical.** Two things here the paper should state precisely:
+`skills/strip_specs.py` / `admit.py` invocation sequences. They can now be
+expressed as user-authored declarative peel manifests built by `peel.py`; the
+resulting editable-file list is passed directly to `run.py`. **This is a
+build-side change only — `run.py` and every gate in §1 are untouched; the
+runtime soundness story is identical.** Two things here the paper should state
+precisely:
 
 - **The cut is now one totally-ordered axis (peel depth).** P1 proofs → P2 lemmas
   → P3 specs → P4 contract, strictly cumulative (depth N removes shells 1..N). The
@@ -226,9 +226,8 @@ identical.** Two things here the paper should state precisely:
   "strip stratum k, keep 1..k-1 as the pin," so the experiment mode is declared
   in the manifest, not derived (see the long NOTE in `peel.py`).
 
-The residual caveats from §2/§3 are unchanged by peel (it builds the same trees):
-the editable-file-local `open spec fn`s are still pinned only by frozen consumers
-+ whole-crate verify + post-run byte-identity audit, not by the spec gate. Build
-provenance for any rung is now reproducible via
-`peel.py --surface --manifest <m> --depth <n>` (preview, no files touched) and the
-mapping in `peel_manifests/README.md`.
+The residual caveats from §2/§3 are unchanged by peel (it builds the same
+trees): the editable-file-local `open spec fn`s are still pinned only by frozen
+consumers + whole-crate verify + post-run byte-identity audit, not by the spec
+gate. Build provenance for any rung is now reproducible via
+`peel.py --surface --manifest <m> --depth <n>` (preview, no files touched).

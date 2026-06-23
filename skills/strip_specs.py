@@ -13,14 +13,15 @@ For the spec-reconstruction experiment:
 Loop clauses and assert-by clauses live inside fn bodies and are never
 touched.
 
-This is a top-level init/harness tool — a sibling of `run.py` / `admit.py`, NOT
-an agent skill. It builds the experiment's starting state before a run; the
-proof agent never invokes it during a round.
+This is an init/harness tool, NOT a proof-round skill. It is stored under
+`skills/` in this public repo for compatibility with the existing layout, but it
+builds the experiment's starting state before a run; the proof agent never
+invokes it during a round.
 
 Usage:
-    python strip_specs.py <file.rs> --in-place
-    python strip_specs.py <file.rs> --out <out.rs> --strip-fn foo
-    python strip_specs.py <file.rs> --in-place \\
+    python skills/strip_specs.py <file.rs> --in-place
+    python skills/strip_specs.py <file.rs> --out <out.rs> --strip-fn foo
+    python skills/strip_specs.py <file.rs> --in-place \\
         --strip-fn dispatcher --delete-fn lemma_a --delete-fn lemma_b
 
 Output (stdout): JSON summary
@@ -39,7 +40,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     handlers=[logging.FileHandler(Path(os.environ.get(
-        "CLI_LOG_PATH", Path(__file__).parent / "cli.log")))],
+        "CLI_LOG_PATH", Path(__file__).parents[1] / "cli.log")))],
 )
 logger = logging.getLogger("strip_specs")
 
