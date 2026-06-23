@@ -12,7 +12,15 @@ Scope of "signature" for this check:
     - `decreases` clause
     - `#[verifier::external_body]` attribute (forbidden to *add*)
 
-What's allowed to change freely: the function body.
+What's allowed to change freely: the function body — EXCEPT, when
+`verify --check-spec-defs` is passed, the body of a `spec fn`. A `spec fn`'s
+body IS its definition (the meaning a frozen `requires`/`ensures` is written
+in), so in a proof-reconstruction experiment where specs are frozen, changing
+an existing spec definition can hollow out a frozen contract without touching
+any clause text. `--check-spec-defs` snapshots every existing spec-fn body and
+fails the round on any change (new spec fns are still allowed; deletion is
+caught as `removed`). This freezes "everything reachable from the contract"
+structurally, since the contract's meaning is exactly its spec closure.
 
 Usage:
     python skills/spec_check.py snapshot <file.rs> --out <snapshot.json>
@@ -67,14 +75,23 @@ def _strip_budget_attrs(s: str) -> str:
 
 
 def _extract_sigs(text: str) -> dict[str, dict]:
-    """Return {name: {header, requires, ensures, decreases, attrs, mode,
-                      external_body, line}}.
+    """Return {key: {name, header, requires, ensures, decreases, mode,
+                     external_body, spec_body, line}}.
+
+    The KEY is the fn name, EXCEPT a name that appears more than once (trait
+    impls for `T` and `&T`, etc.) is disambiguated by occurrence index:
+    `name`, `name#1`, `name#2`, … — so a later same-named fn no longer
+    overwrites an earlier one. This matters for the freeze gates: dalek has
+    real duplicate `spec fn`s (e.g. edwards.rs `neg_spec`/`neg_req`), and
+    keying by bare name would leave the first occurrence's body unmonitored.
+    The real `name` is kept in the dict for drift reporting.
 
     Note: `header` excludes budget-tuning attributes
     (`#[verifier::rlimit(N)]`, etc.) so the agent can adjust them without
     tripping the drift gate. Other `#[verifier::*]` attrs remain captured.
     """
     sigs: dict[str, dict] = {}
+    name_counts: dict[str, int] = {}
     for m in _FN_START_RE.finditer(text):
         name = m.group("name")
         start = m.start()
@@ -85,16 +102,75 @@ def _extract_sigs(text: str) -> dict[str, dict]:
         header = text[start:header_end]
         line = text.count("\n", 0, start) + 1
         attrs = m.group("attr") or ""
-        sigs[name] = {
+        mode = (m.group("mode") or "").strip()
+        # For a `spec fn` with an in-language body (`{ … }`, not an
+        # `external_body`/`uninterp` `;` declaration), capture the body — it is
+        # the function's *definition*. `_find_header_end` returns the index OF
+        # the opening `{` for a body, or the index AFTER the `;` for a decl, so
+        # `text[header_end] == "{"` distinguishes the two.
+        spec_body = ""
+        if mode == "spec" and header_end < len(text) and text[header_end] == "{":
+            body_end = _find_matching_brace(text, header_end)
+            if body_end is not None:
+                spec_body = _normalize(text[header_end + 1:body_end - 1])
+            else:
+                logger.warning("spec_check: could not find body end for spec fn %s", name)
+        occ = name_counts.get(name, 0)
+        name_counts[name] = occ + 1
+        key = name if occ == 0 else f"{name}#{occ}"
+        sigs[key] = {
+            "name": name,
             "header": _normalize(_strip_budget_attrs(header)),
             "requires": _section(header, "requires"),
             "ensures": _section(header, "ensures"),
             "decreases": _section(header, "decreases"),
-            "mode": (m.group("mode") or "").strip(),
+            "mode": mode,
             "external_body": "external_body" in attrs,
+            "spec_body": spec_body,
             "line": line,
         }
     return sigs
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int | None:
+    """Given `open_idx` = the index of a `{`, return the index just PAST its
+    matching `}`. Skips `//` / `/* */` comments and `"…"` strings (same rules
+    as `_find_header_end`). Returns None if unbalanced."""
+    i = open_idx
+    depth = 0
+    in_str = False
+    while i < len(text):
+        c = text[i]
+        if not in_str and c == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            if nl == -1:
+                return None
+            i = nl + 1
+            continue
+        if not in_str and c == "/" and i + 1 < len(text) and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            if close == -1:
+                return None
+            i = close + 2
+            continue
+        if in_str:
+            if c == "\\" and i + 1 < len(text):
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
 
 
 def _find_header_end(text: str, start: int) -> int | None:
@@ -268,31 +344,54 @@ def cmd_snapshot(args) -> int:
     return 0
 
 
-def _verify_one(file_path: str, original: dict, current: dict) -> list[dict]:
+def _verify_one(file_path: str, original: dict, current: dict,
+                check_spec_defs: bool = False) -> list[dict]:
     """Return drift entries for one file. Each entry carries a `file` key
-    so callers can route by source file."""
+    so callers can route by source file.
+
+    `check_spec_defs`: also treat a change to an existing `spec fn`'s BODY
+    (its definition) as drift — used when specs are frozen so the agent
+    cannot weaken a contract by redefining the vocabulary it's written in."""
     drift: list[dict] = []
-    for name, orig in original.items():
-        if name not in current:
-            drift.append({"file": file_path, "function": name,
+    # `key` disambiguates duplicate fn names (name, name#1, …); `fn_name` is the
+    # real source name reported in drift entries.
+    for key, orig in original.items():
+        fn_name = orig.get("name", key)
+        if key not in current:
+            drift.append({"file": file_path, "function": fn_name,
                           "change": "removed",
                           "original_line": orig.get("line")})
             continue
-        cur = current[name]
+        cur = current[key]
         for field_ in ("header", "requires", "ensures", "decreases", "mode"):
             if orig[field_] != cur[field_]:
                 drift.append({
                     "file": file_path,
-                    "function": name,
+                    "function": fn_name,
                     "change": "modified",
                     "field": field_,
                     "original": orig[field_][:400],
                     "current": cur[field_][:400],
                     "line": cur.get("line"),
                 })
+        # Spec-definition freeze: an existing `spec fn`'s body is its meaning.
+        # Guarded on `"spec_body" in orig` for back-compat with pre-field
+        # snapshots (won't false-positive on an older baseline).
+        if (check_spec_defs and orig.get("mode") == "spec"
+                and "spec_body" in orig
+                and orig.get("spec_body", "") != cur.get("spec_body", "")):
+            drift.append({
+                "file": file_path,
+                "function": fn_name,
+                "change": "spec_def_modified",
+                "field": "spec_body",
+                "original": (orig.get("spec_body") or "")[:400],
+                "current": (cur.get("spec_body") or "")[:400],
+                "line": cur.get("line"),
+            })
         if cur["external_body"] and not orig["external_body"]:
             drift.append({
-                "file": file_path, "function": name,
+                "file": file_path, "function": fn_name,
                 "change": "external_body_added",
                 "line": cur.get("line"),
             })
@@ -322,7 +421,8 @@ def cmd_verify(args) -> int:
             continue
         current = _extract_sigs(p.read_text())
         original = entry["sigs"]
-        drift.extend(_verify_one(file_path, original, current))
+        drift.extend(_verify_one(file_path, original, current,
+                                 check_spec_defs=args.check_spec_defs))
         added = sorted(set(current) - set(original))
         if added:
             new_fns[file_path] = added
@@ -361,6 +461,11 @@ def main() -> None:
     ver = sub.add_parser("verify")
     ver.add_argument("target", type=Path)
     ver.add_argument("--against", type=Path, required=True)
+    ver.add_argument("--check-spec-defs", action="store_true",
+                     help="Also fail on any change to an existing spec fn's "
+                          "BODY (its definition). Use when specs are frozen so "
+                          "a contract can't be weakened by redefining its "
+                          "vocabulary. New spec fns remain allowed.")
     ver.set_defaults(func=cmd_verify)
 
     lst = sub.add_parser("list-siblings")

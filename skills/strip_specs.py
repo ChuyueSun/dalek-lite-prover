@@ -13,10 +13,14 @@ For the spec-reconstruction experiment:
 Loop clauses and assert-by clauses live inside fn bodies and are never
 touched.
 
+This is a top-level init/harness tool — a sibling of `run.py` / `admit.py`, NOT
+an agent skill. It builds the experiment's starting state before a run; the
+proof agent never invokes it during a round.
+
 Usage:
-    python skills/strip_specs.py <file.rs> --in-place
-    python skills/strip_specs.py <file.rs> --out <out.rs> --strip-fn foo
-    python skills/strip_specs.py <file.rs> --in-place \\
+    python strip_specs.py <file.rs> --in-place
+    python strip_specs.py <file.rs> --out <out.rs> --strip-fn foo
+    python strip_specs.py <file.rs> --in-place \\
         --strip-fn dispatcher --delete-fn lemma_a --delete-fn lemma_b
 
 Output (stdout): JSON summary
@@ -35,7 +39,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     handlers=[logging.FileHandler(Path(os.environ.get(
-        "CLI_LOG_PATH", Path(__file__).parents[1] / "cli.log")))],
+        "CLI_LOG_PATH", Path(__file__).parent / "cli.log")))],
 )
 logger = logging.getLogger("strip_specs")
 
@@ -339,6 +343,207 @@ def _find_body_end(text: str, body_open: int) -> int:
     return n  # defensive
 
 
+def _match_delim(text: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    """Walk from `open_idx` (index of `open_ch`) to the matching `close_ch`,
+    returning the index right after it. Token-aware: skips `//`/`/* */`
+    comments and `"..."` strings. Used to bracket `(...)` in assert headers
+    where `_find_body_end` (braces only) doesn't apply."""
+    depth = 0
+    in_str = False
+    i = open_idx
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if not in_str and c == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = nl + 1 if nl != -1 else n
+            continue
+        if not in_str and c == "/" and i + 1 < n and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            i = close + 2 if close != -1 else n
+            continue
+        if in_str:
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n  # defensive
+
+
+def _assert_stmt_end(text: str, paren_open: int, limit: int) -> int:
+    """Given the `(` opening an `assert(...)` proof statement, return the
+    index just past the end of the whole statement. Handles the three Verus
+    forms:
+      - `assert(EXPR);`
+      - `assert(EXPR) by (lemma(...));`
+      - `assert(EXPR) by { ... }`   (block form — no trailing `;`)
+    """
+    i = _match_delim(text, paren_open, "(", ")")          # past the `(...)`
+    # skip whitespace / comments
+    while i < limit:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        if c == "/" and i + 1 < limit and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = nl + 1 if nl != -1 else limit
+            continue
+        if c == "/" and i + 1 < limit and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            i = close + 2 if close != -1 else limit
+            continue
+        break
+    # optional `by (...)` / `by { ... }`
+    if text[i:i + 2] == "by" and (i + 2 >= limit or not (text[i + 2].isalnum()
+                                                         or text[i + 2] == "_")):
+        i += 2
+        while i < limit and text[i] in " \t\r\n":
+            i += 1
+        if i < limit and text[i] == "{":
+            return _find_body_end(text, i)   # block form: statement ends at `}`
+        if i < limit and text[i] == "(":
+            i = _match_delim(text, i, "(", ")")
+    while i < limit and text[i] in " \t\r\n":
+        i += 1
+    if i < limit and text[i] == ";":
+        i += 1
+    return i
+
+
+def _proof_spans_in_body(text: str, body_open: int, body_end: int
+                         ) -> list[tuple[int, int]]:
+    """Return [(start, end), ...] spans of proof-only constructs inside the
+    fn body `(body_open, body_end)`: `proof { ... }` blocks (at any nesting
+    depth) and standalone `assert(...)` proof statements. Token-aware so a
+    `proof`/`assert` inside a string or comment is ignored, and `assert!`
+    (the exec macro) / `debug_assert` are NOT matched."""
+    spans: list[tuple[int, int]] = []
+    i = body_open + 1
+    n = body_end
+    in_str = False
+    while i < n:
+        c = text[i]
+        if not in_str and c == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = nl + 1 if nl != -1 else n
+            continue
+        if not in_str and c == "/" and i + 1 < n and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            i = close + 2 if close != -1 else n
+            continue
+        if in_str:
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        # keyword at a word boundary?
+        if (c in "pa") and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            kw = "proof" if text.startswith("proof", i) else (
+                 "assert" if text.startswith("assert", i) else "")
+            if kw:
+                j = i + len(kw)
+                # must be a real token end (not `proofy` / `asserts` / `assert!`)
+                if j < n and (text[j].isalnum() or text[j] == "_" or text[j] == "!"):
+                    i += 1
+                    continue
+                k = j
+                while k < n and text[k] in " \t\r\n":
+                    k += 1
+                if kw == "proof" and k < n and text[k] == "{":
+                    end = _find_body_end(text, k)
+                    spans.append((i, end))
+                    i = end
+                    continue
+                if kw == "assert" and k < n and text[k] == "(":
+                    end = _assert_stmt_end(text, k, n)
+                    spans.append((i, end))
+                    i = end
+                    continue
+        i += 1
+    return spans
+
+
+def strip_proof_from_fns(text: str, names: set[str]) -> tuple[str, list[str]]:
+    """Remove proof-only content from the BODY of each named fn while keeping
+    its signature, `requires`/`ensures`/`decreases` contract, and executable
+    statements. Removes `proof { ... }` blocks and standalone `assert(...)`
+    proof statements (which are spec-mode in Verus).
+
+    Used by the `--no-anchor-proof` rung: it strips the anchor
+    `decompress`'s own orchestration proof so the agent must reconstruct it,
+    leaving the frozen contract (the only thing the soundness gate protects)
+    untouched. Returns (new_text, list_of_fn_names_touched)."""
+    # Collect removal spans across all targeted fns, then splice once.
+    all_spans: list[tuple[int, int]] = []
+    touched: list[str] = []
+    for m in _FN_START_RE.finditer(text):
+        name = m.group("name")
+        if name not in names:
+            continue
+        # Floor guard: never strip proof content out of a trusted axiom, even
+        # if named (e.g. by `strip-all`, which auto-names every fn). A normal
+        # `axiom_*` body is `{ admit() }` with nothing to strip, so this is a
+        # no-op on real axioms — but it makes floor-safety STRUCTURAL rather
+        # than dependent on axiom bodies happening to contain no proof{}/assert.
+        if name.startswith("axiom_"):
+            continue
+        markers = list(_scan_header(text, m.end()))
+        if not markers:
+            continue
+        body_open = markers[-1][2]
+        if body_open >= len(text) or text[body_open] != "{":
+            continue  # forward decl (`;`) — no body
+        body_end = _find_body_end(text, body_open)
+        spans = _proof_spans_in_body(text, body_open, body_end)
+        if spans:
+            all_spans.extend(spans)
+            touched.append(m.group("name"))
+
+    if not all_spans:
+        return text, []
+
+    all_spans.sort()
+    out: list[str] = []
+    cursor = 0
+    for s, e in all_spans:
+        # Pull in the leading indentation on the span's line and the trailing
+        # newline so removing a block doesn't leave a blank, half-indented line.
+        line_start = text.rfind("\n", 0, s) + 1
+        if text[line_start:s].strip() == "":
+            s = line_start
+        j = e
+        while j < len(text) and text[j] in " \t":
+            j += 1
+        if j < len(text) and text[j] == "\n":
+            j += 1
+        out.append(text[cursor:s])
+        cursor = j
+    out.append(text[cursor:])
+    return "".join(out), touched
+
+
 def _walk_back_doc_comments(text: str, start: int) -> int:
     """Walk backward from `start` over consecutive `///` doc-comment lines.
     Stops at the first non-doc-comment line (blank lines included — those
@@ -401,10 +606,22 @@ def delete_text(text: str, names: set[str]) -> tuple[str, list[str]]:
     return "".join(out_parts), deleted
 
 
+_DOC_LINE_RE = re.compile(r"(?m)^[ \t]*///.*\n?")
+
+
+def strip_doc_comments(text: str) -> tuple[str, int]:
+    """Remove `///` outer doc-comment lines and report how many. These carry
+    the informal spec / proof sketch in natural language; the formal-clause
+    strip leaves them, so a genuinely "no spec" surface needs this too. Inner
+    `//!` module docs and plain `//` code comments are left alone."""
+    n = len(_DOC_LINE_RE.findall(text))
+    return _DOC_LINE_RE.sub("", text), n
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Strip requires/ensures/decreases from fn headers; "
-                    "optionally delete whole fns.")
+                    "optionally delete whole fns and/or /// doc comments.")
     ap.add_argument("target", type=Path)
     grp = ap.add_mutually_exclusive_group(required=True)
     grp.add_argument("--out", type=Path, help="Write output here")
@@ -418,22 +635,46 @@ def main() -> int:
                     help="Delete this fn entirely — sig + body + leading "
                          "/// doc comments (repeatable). Used for proof-only "
                          "artifacts (lemmas, spec fns).")
+    ap.add_argument("--strip-proof-fn", action="append", default=None,
+                    help="Remove proof-only content (`proof { ... }` blocks "
+                         "and standalone `assert(...)` statements) from this "
+                         "fn's BODY, keeping its signature, requires/ensures/"
+                         "decreases contract, and executable statements "
+                         "(repeatable). Used by the --no-anchor-proof rung to "
+                         "strip the anchor's own orchestration proof.")
+    ap.add_argument("--strip-docs", action="store_true",
+                    help="Also remove all `///` doc-comment lines (the "
+                         "informal spec / proof sketch). Combine with the "
+                         "default clause-strip for a genuinely no-spec surface "
+                         "— only the fn signature survives.")
     args = ap.parse_args()
 
     text = args.target.read_text()
     bytes_before = len(text)
     deleted: list[str] = []
     stripped: list[str] = []
+    proof_stripped: list[str] = []
+    docs_removed = 0
 
     # Delete first so the strip pass walks the post-deletion text.
     if args.delete_fn:
         text, deleted = delete_text(text, set(args.delete_fn))
 
+    # Proof-body strip before clause-strip so spans are computed against the
+    # contract-bearing header still in place.
+    if args.strip_proof_fn:
+        text, proof_stripped = strip_proof_from_fns(text, set(args.strip_proof_fn))
+
     if args.strip_fn:
         text, stripped = strip_text(text, only=set(args.strip_fn))
-    elif not args.delete_fn:
-        # Default: no per-fn targeting → strip all
+    elif not args.delete_fn and not args.strip_proof_fn:
+        # Default: no per-fn targeting at all → strip every fn's clauses.
+        # (A bare --delete-fn or --strip-proof-fn is targeted, so it must NOT
+        # trigger the strip-all fallback.)
         text, stripped = strip_text(text, only=None)
+
+    if args.strip_docs:
+        text, docs_removed = strip_doc_comments(text)
 
     dest = args.target if args.in_place else args.out
     dest.write_text(text)
@@ -443,11 +684,14 @@ def main() -> int:
         "out": str(dest),
         "stripped": stripped,
         "deleted": deleted,
+        "proof_stripped": proof_stripped,
+        "docs_removed": docs_removed,
         "bytes_before": bytes_before,
         "bytes_after": len(text),
     }
-    logger.info("strip_specs: file=%s stripped=%d deleted=%d",
-                args.target, len(stripped), len(deleted))
+    logger.info("strip_specs: file=%s stripped=%d deleted=%d proof_stripped=%d docs=%d",
+                args.target, len(stripped), len(deleted),
+                len(proof_stripped), docs_removed)
     print(json.dumps(result, indent=2))
     return 0
 

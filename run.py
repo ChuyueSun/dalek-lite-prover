@@ -1770,9 +1770,16 @@ def run_task(
         if no_spec_gate:
             spec_drift = []
         else:
+            # When the gate is on, specs are frozen — so freeze spec fn
+            # DEFINITIONS (bodies) too, not just headers. Otherwise a spec fn
+            # co-located in an editable file (e.g. edwards.rs's open spec fns,
+            # or the lemma files in --strip-to-fields) could be redefined to
+            # hollow out a frozen contract without tripping a header check.
+            # Folds into spec_drift → SPEC_DRIFT (non-promotable).
             rc_spec, spec_stdout, _ = run_subskill(
                 [sys.executable, str(HERE / "skills" / "spec_check.py"),
-                 "verify", str(target), "--against", str(spec_snapshot)],
+                 "verify", str(target), "--against", str(spec_snapshot),
+                 "--check-spec-defs"],
                 env=env,
             )
             try:
